@@ -19,6 +19,9 @@ import inspect
 import os
 from typing import Optional
 
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 class RolloutTraceConfig:
     """Configuration for rollout tracing with various backends.
@@ -175,9 +178,11 @@ def rollout_trace_op(func):
                 result = await func(self, *args, **kwargs)
 
                 if enable_token2text:
+                    logger.info("add_token2text")
                     _result = await add_token2text(self, result)
                     tracer.finish_call(call, output=_result)
                 else:
+                    logger.info("no add_token2text")
                     tracer.finish_call(call, output=result)
 
                 return result
