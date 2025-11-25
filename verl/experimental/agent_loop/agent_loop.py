@@ -18,6 +18,7 @@ import os
 import random
 from abc import ABC, abstractmethod
 from typing import Any, Optional
+from uuid import uuid4
 
 import hydra
 import numpy as np
@@ -29,9 +30,11 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
+from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
+from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.experimental.reward import RewardManagerWorker
 from verl.protocol import DataProto
-from verl.single_controller.ray.base import RayWorkerGroup
+from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
@@ -105,7 +108,7 @@ class AsyncLLMServerManager:
         """
         server = self._choose_server(request_id)
         output = await server.generate.remote(
-            request_id=request_id,
+            request_id=uuid4().hex,  # use new request_id for each turn
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
@@ -175,7 +178,7 @@ class _DummyConfig:
 
 
 class AgentLoopBase(ABC):
-    """An agent loop takes a input message, chat with OpenAI compatible LLM server and interact with various
+    """An agent loop takes an input message, chat with OpenAI compatible LLM server and interact with various
     environments."""
 
     _class_initialized = False
@@ -281,7 +284,8 @@ class AgentLoopWorkerBase:
 
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
         if agent_loop_config_path:
-            agent_loop_configs = OmegaConf.load(agent_loop_config_path)
+            resolved_path = resolve_config_path(agent_loop_config_path)
+            agent_loop_configs = OmegaConf.load(resolved_path)
             for agent_loop_config in agent_loop_configs:
                 _agent_loop_registry[agent_loop_config.name] = agent_loop_config
         if self.config.actor_rollout_ref.model.get("custom_chat_template", None) is not None:
@@ -302,6 +306,7 @@ class AgentLoopWorkerBase:
             self.config.trainer.experiment_name,
             trace_config.get("backend"),
             trace_config.get("token2text", False),
+            trace_config.get("max_samples_per_step_per_worker", None),
         )
 
     @tqbridge()
@@ -349,17 +354,39 @@ class AgentLoopWorkerBase:
         else:
             index = np.arange(len(batch))
 
+        max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
+
+        # For n rollouts per sample, we trace all n rollouts for selected samples
+        # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
+        if max_samples_per_worker is not None:
+            unique_sample_indices = np.unique(index)
+            if max_samples_per_worker < len(unique_sample_indices):
+                selected_samples = set(
+                    np.random.choice(unique_sample_indices, max_samples_per_worker, replace=False).tolist()
+                )
+                traced_indices = set(i for i in range(len(batch)) if index[i] in selected_samples)
+            else:
+                traced_indices = set(range(len(batch)))
+        else:
+            traced_indices = set(range(len(batch)))
+
         trajectory_info = await get_trajectory_info(
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
         tasks = []
         for i in range(len(batch)):
+            trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-            tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
+            tasks.append(
+                asyncio.create_task(
+                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                )
+            )
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)
+
         return output
 
     async def _run_agent_loop(
@@ -368,6 +395,7 @@ class AgentLoopWorkerBase:
         trajectory: dict[str, Any],
         *,
         agent_name: str,
+        trace: bool = True,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         with rollout_trace_attr(
@@ -376,6 +404,7 @@ class AgentLoopWorkerBase:
             rollout_n=trajectory["rollout_n"],
             validate=trajectory["validate"],
             name="agent_loop",
+            trace=trace,
         ):
             assert agent_name in _agent_loop_registry, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
@@ -390,6 +419,7 @@ class AgentLoopWorkerBase:
                 processor=self.processor,
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -603,7 +633,7 @@ class AgentLoopWorkerBase:
             meta_info={"metrics": metrics, "reward_extra_keys": reward_extra_keys},
         )
 
-    def create_transferqueue_client(self, controller_infos, storage_infos, role):
+    def create_transferqueue_client(self, controller_info, role):
         """Create a client for data system(transfer queue)."""
         from verl.single_controller.ray.base import get_random_string
         from verl.utils.transferqueue_utils import create_transferqueue_client
@@ -611,8 +641,8 @@ class AgentLoopWorkerBase:
         client_name = get_random_string(length=6)
         create_transferqueue_client(
             client_id=f"{role}_worker_{client_name}",
-            controller_infos=controller_infos,
-            storage_infos=storage_infos,
+            controller_info=controller_info,
+            config=self.config,
         )
 
 
@@ -657,12 +687,15 @@ async def get_trajectory_info(step, index, validate):
 class AgentLoopManager:
     """Agent loop manager that manages a group of agent loop workers."""
 
-    def __init__(self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_wg: RayWorkerGroup = None):
+    def __init__(
+        self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_resource_pool: RayResourcePool = None
+    ):
         """Initialize agent loop manager.
 
         Args:
             config (DictConfig): trainer config.
             worker_group (RayWorkerGroup): ActorRolloutRef worker group for hybrid mode; None for standalone mode.
+            rm_resource_pool (RayResourcePool): Resource pool for reward model (Standalone mode).
         """
         self.config = config
         self.worker_group = worker_group
@@ -671,7 +704,9 @@ class AgentLoopManager:
         if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
             from verl.experimental.reward import RewardModelManager
 
-            self.reward_model_manager = RewardModelManager(config.reward_model, rm_wg)
+            # TODO (dyy): current rm is colocated with the legacy fsdp/megatron rm
+            # future pr will depericate fsdp/megatron rm and init RewardModelManager in standalone mode
+            self.reward_model_manager = RewardModelManager(config.reward_model, rm_resource_pool)
             self.reward_router_address = self.reward_model_manager.get_router_address()
 
         # for recipe to change
@@ -718,6 +753,14 @@ class AgentLoopManager:
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
 
+        print(f"AgentLoopManager: {self.server_addresses}")
+
+        # Update Prometheus configuration with server addresses
+        if rollout_config.prometheus.enable:
+            if rollout_config.disable_log_stats:
+                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+            update_prometheus_config(rollout_config.prometheus, self.server_addresses)
+
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
@@ -745,9 +788,10 @@ class AgentLoopManager:
             DataProto: Output batch.
         """
 
-        if self.config.actor_rollout_ref.rollout.free_cache_engine:
-            self.wake_up()
-        if self.reward_model_manager and self.config.reward_model.rollout.free_cache_engine:
+        # Fix for Issue #4147: Always call wake_up() to ensure weight sync
+        # The wake_up()/sleep() methods internally check free_cache_engine
+        self.wake_up()
+        if self.reward_model_manager:
             self.reward_model_manager.wake_up()
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
@@ -758,9 +802,9 @@ class AgentLoopManager:
             ]
         )
         output = DataProto.concat(outputs)
-        if self.config.actor_rollout_ref.rollout.free_cache_engine:
-            self.sleep()
-        if self.reward_model_manager and self.config.reward_model.rollout.free_cache_engine:
+        # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
+        self.sleep()
+        if self.reward_model_manager:
             self.reward_model_manager.sleep()
 
         # calculate performance metrics
