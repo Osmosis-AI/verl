@@ -24,8 +24,6 @@ Key Features:
 - Concurrency control via semaphore
 - Pre-flight health check for early error detection
 - Graceful degradation on rollout failures
-
-See design doc section 4.3 for specifications.
 """
 
 import asyncio

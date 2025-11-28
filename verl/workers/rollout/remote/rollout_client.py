@@ -20,8 +20,6 @@ and the external RolloutServer. It provides:
 - Retry logic with exponential backoff
 - Timeout handling
 - Error classification
-
-See design doc section 4.2 for specifications.
 """
 
 import asyncio

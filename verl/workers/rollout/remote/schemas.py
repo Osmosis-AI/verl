@@ -17,8 +17,6 @@
 These schemas define the request/response format between RemoteAgentLoop (verl)
 and the external RolloutServer. They ensure consistent data exchange and enable
 validation on both sides.
-
-See design doc section 5 for detailed specifications.
 """
 
 from typing import Any, Optional
