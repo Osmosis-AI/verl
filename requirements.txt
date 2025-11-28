@@ -21,6 +21,7 @@ wandb
 packaging>=20.0
 uvicorn
 fastapi
+httpx>=0.24.0
 latex2sympy2_extended
 math_verify
 tensorboard

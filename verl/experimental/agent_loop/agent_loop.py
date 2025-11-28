@@ -645,6 +645,20 @@ class AgentLoopWorkerBase:
             config=self.config,
         )
 
+    async def shutdown(self):
+        """Cleanup resources on worker shutdown.
+
+        This method should be called when the worker is being terminated
+        to properly release shared resources like connection pools.
+        """
+        # Cleanup RemoteAgentLoop's connection pool if it was used
+        try:
+            from verl.experimental.agent_loop.remote_agent_loop import RemoteAgentLoop
+
+            await RemoteAgentLoop.cleanup_class()
+        except ImportError:
+            logger.debug("RemoteAgentLoop not imported, skipping remote cleanup")
+
 
 @ray.remote
 class AgentLoopWorker(AgentLoopWorkerBase):
