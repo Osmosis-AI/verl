@@ -39,7 +39,13 @@ from sglang.srt.managers.tokenizer_manager import ServerStatus
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+from verl.workers.rollout.replica import (
+    HttpGenerateRequest,
+    HttpGenerateResponse,
+    RolloutMode,
+    RolloutReplica,
+    TokenOutput,
+)
 from verl.workers.rollout.sglang_rollout.sglang_rollout import ServerAdapter, _set_envs_and_config
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
 
@@ -196,6 +202,27 @@ class SGLangHttpServer:
         app.is_single_tokenizer_mode = True
         app.server_args = server_args
         app.warmup_thread_args = (server_args, None, None)
+
+        # Add /v1/generate endpoint for backend-agnostic generation
+        server_instance = self
+
+        @app.post("/v1/generate", response_model=HttpGenerateResponse)
+        async def generate_endpoint(request: HttpGenerateRequest) -> HttpGenerateResponse:
+            """Backend-agnostic generation endpoint accepting token IDs."""
+            # Convert list[int] to torch.Tensor for SGLang
+            prompt_ids_tensor = torch.tensor(request.prompt_ids, dtype=torch.long)
+            output = await server_instance.generate(
+                prompt_ids=prompt_ids_tensor,
+                sampling_params=request.sampling_params,
+                request_id=request.request_id,
+                image_data=request.image_data,
+            )
+            return HttpGenerateResponse(
+                token_ids=list(output.token_ids),
+                log_probs=list(output.log_probs) if output.log_probs else None,
+                prompt_token_ids=request.prompt_ids,
+            )
+
         self._server_port, self._server_task = await run_unvicorn(app, server_args, self._server_address)
         self.tokenizer_manager.server_status = ServerStatus.Up
 
