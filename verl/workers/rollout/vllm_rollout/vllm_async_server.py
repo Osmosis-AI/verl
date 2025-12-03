@@ -45,13 +45,7 @@ from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RewardModelConfig, RolloutConfig
-from verl.workers.rollout.replica import (
-    HttpGenerateRequest,
-    HttpGenerateResponse,
-    RolloutMode,
-    RolloutReplica,
-    TokenOutput,
-)
+from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
 from verl.workers.rollout.vllm_rollout.utils import (
@@ -366,25 +360,6 @@ class vLLMHttpServerBase:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
         self.engine = engine_client
-
-        # Add /v1/generate endpoint for backend-agnostic generation
-        server_instance = self
-
-        @app.post("/v1/generate", response_model=HttpGenerateResponse)
-        async def generate_endpoint(request: HttpGenerateRequest) -> HttpGenerateResponse:
-            """Backend-agnostic generation endpoint accepting token IDs."""
-            output = await server_instance.generate(
-                prompt_ids=request.prompt_ids,
-                sampling_params=request.sampling_params,
-                request_id=request.request_id,
-                image_data=request.image_data,
-            )
-            return HttpGenerateResponse(
-                token_ids=list(output.token_ids),
-                log_probs=list(output.log_probs) if output.log_probs else None,
-                prompt_token_ids=request.prompt_ids,
-            )
-
         self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
 
     async def run_headless(self, args: argparse.Namespace):

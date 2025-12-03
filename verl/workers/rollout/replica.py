@@ -16,7 +16,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel
@@ -35,29 +35,6 @@ class TokenOutput(BaseModel):
     """response token ids"""
     log_probs: Optional[list[float]] = None
     """logprobs of response token ids"""
-
-
-class HttpGenerateRequest(BaseModel):
-    """HTTP request body for /v1/generate endpoint.
-
-    Backend-agnostic generation request accepting token IDs directly.
-    """
-
-    request_id: str
-    prompt_ids: list[int]
-    sampling_params: dict[str, Any]
-    image_data: Optional[list[Any]] = None
-
-
-class HttpGenerateResponse(BaseModel):
-    """HTTP response body for /v1/generate endpoint.
-
-    Returns generated token IDs and optionally log probabilities.
-    """
-
-    token_ids: list[int]
-    log_probs: Optional[list[float]] = None
-    prompt_token_ids: list[int]
 
 
 class RolloutMode(Enum):
