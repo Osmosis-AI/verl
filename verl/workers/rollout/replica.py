@@ -35,6 +35,8 @@ class TokenOutput(BaseModel):
     """response token ids"""
     log_probs: Optional[list[float]] = None
     """logprobs of response token ids"""
+    tool_calls: Optional[list[dict]] = None
+    """optional OpenAI-style tool calls extracted from generation"""
 
 
 class RolloutMode(Enum):
