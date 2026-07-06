@@ -6,8 +6,9 @@ set -xeuo pipefail
 ROLLOUT_NAME="vllm" # sglang or vllm
 
 FAMILY="Qwen"
-STUDENT_MODEL=Qwen3-4B
-TEACHER_MODEL=Qwen3-32B
+STUDENT_MODEL=Qwen2.5-0.5B
+TEACHER_MODEL=Qwen2.5-3B-Instruct
+
 
 # USE_POLICY_GRADIENT=False
 # DISTILLATION_LOSS_MODE="forward_kl_topk"
@@ -20,17 +21,17 @@ USE_FUSED_KERNELS=False
 DISTILLATION_LOSS_MAX_CLAMP=10.0
 DISTILLATION_LOG_PROB_MIN_CLAMP=-10.0
 
-PROJECT_NAME='verl_on_policy_distillation_example_gsm8k'
+PROJECT_NAME='verl_on_policy_distillation_example_dapo_math_17k'
 
-MAX_PROMPT=512
-MAX_RESPONSE_LENGTH=8192
+MAX_PROMPT=256
+MAX_RESPONSE_LENGTH=512
 MAX_NUM_TOKENS=$(( MAX_PROMPT + MAX_RESPONSE_LENGTH + 1 ))
 TRAIN_PROMPT_BSZ=128
-STUDENT_MICRO_BATCH_SIZE_PER_GPU=1
+STUDENT_MICRO_BATCH_SIZE_PER_GPU=2
 STUDENT_MAX_TOKEN_LEN_PER_GPU=$(( STUDENT_MICRO_BATCH_SIZE_PER_GPU * (MAX_PROMPT + MAX_RESPONSE_LENGTH) ))
 USE_DYNAMIC_BSZ=True
 
-STUDENT_WORLD_SIZE=4
+STUDENT_WORLD_SIZE=2
 
 TEACHER_WORLD_SIZE=4
 
@@ -42,11 +43,11 @@ ENFORCE_EAGER=False # true for faster debugging
 
 ############################ Paths ############################
 
-gsm8k_train_path=/data/gsm8k/train.parquet
-gsm8k_test_path=/data/gsm8k/test.parquet
+dapo_math_train_path=$DATA_PATH/dapo-math-17k/train.parquet
+dapo_math_test_path=$DATA_PATH/dapo-math-17k/test.parquet
 
-TRAIN_FILES="['$gsm8k_train_path']"
-TEST_FILES="['$gsm8k_test_path']"
+TRAIN_FILES="['$dapo_math_train_path']"
+TEST_FILES="['$dapo_math_test_path']"
 
 ############################ Parameter Groups ############################
 
@@ -77,11 +78,11 @@ DISTILLATION=(
     distillation.teacher_models.teacher_model.model_path="${FAMILY}/${TEACHER_MODEL}"
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1
     distillation.teacher_models.teacher_model.inference.name=$ROLLOUT_NAME
-    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.8
+    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.3
     distillation.teacher_models.teacher_model.inference.enforce_eager=$ENFORCE_EAGER
     distillation.teacher_models.teacher_model.inference.max_model_len=$MAX_NUM_TOKENS
     distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=$MAX_NUM_TOKENS
-    distillation.teacher_models.teacher_model.inference.max_num_seqs=$MAX_NUM_TOKENS
+    distillation.teacher_models.teacher_model.inference.max_num_seqs=128
     +distillation.teacher_models.teacher_model.nitrobrew_d_comp=5120
     distillation.distillation_loss.loss_mode=$DISTILLATION_LOSS_MODE
     distillation.distillation_loss.topk=64
@@ -98,8 +99,8 @@ STUDENT=(
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$STUDENT_MICRO_BATCH_SIZE_PER_GPU
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$STUDENT_MAX_TOKEN_LEN_PER_GPU
     actor_rollout_ref.actor.use_dynamic_bsz=$USE_DYNAMIC_BSZ
-    actor_rollout_ref.actor.fsdp_config.param_offload=False
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+    actor_rollout_ref.actor.fsdp_config.param_offload=True
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=$SP
 )
 
@@ -109,7 +110,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=$USE_DYNAMIC_BSZ
     actor_rollout_ref.rollout.tensor_model_parallel_size=1
     actor_rollout_ref.rollout.name=$ROLLOUT_NAME
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.3
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.9
     actor_rollout_ref.rollout.calculate_log_probs=False
     actor_rollout_ref.rollout.max_model_len=$MAX_NUM_TOKENS
     actor_rollout_ref.rollout.max_num_batched_tokens=$MAX_NUM_TOKENS
@@ -130,7 +131,7 @@ TRAINER=(
     trainer.nnodes=1
     trainer.save_freq=200
     trainer.test_freq=5
-    trainer.total_epochs=1
+    trainer.total_epochs=15
     trainer.val_before_train=False
     trainer.resume_mode=disable
     trainer.log_val_generations=5

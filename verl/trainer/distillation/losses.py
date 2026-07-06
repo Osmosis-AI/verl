@@ -132,6 +132,11 @@ def compute_topk_loss(
     """Compute per-token distillation loss in the logits processor.
 
     Dispatches to top-k or Nitrobrew (hidden-state) loss based on loss_mode.
+
+    Cross-tokenizer (one-time hack): on the FSDP nitrobrew path, also forwards
+    ``student_byte_offsets`` / ``teacher_byte_offsets`` from the batch to the loss so
+    it can byte-align the two tokenizations. Megatron is unsupported for this and
+    raises if cross-tokenizer data is present.
     """
     loss_settings = distillation_config.distillation_loss.loss_settings
 
@@ -149,18 +154,32 @@ def compute_topk_loss(
                 distillation_loss_fn = megatron_nb.compute_nitrobrew_kl
                 if use_reverse:
                     raise NotImplementedError("Nitrobrew reverse KL not yet implemented for Megatron")
+                if data.get("teacher_byte_offsets", None) is not None:
+                    raise NotImplementedError(
+                        "cross-tokenizer ULD distillation is only implemented for the FSDP strategy."
+                    )
             case _:
                 raise NotImplementedError(f"Nitrobrew not implemented for strategy: {config.strategy=}")
 
         teacher_unembed = data["teacher_unembed"]
         if hasattr(teacher_unembed, "data"):
             teacher_unembed = teacher_unembed.data
+
+        # Cross-tokenizer (one-time hack): pass byte offsets to the FSDP nitrobrew
+        # loss so it can align teacher/student by byte boundaries. Only the
+        # fsdp/veomni path accepts these kwargs.
+        extra_kwargs = {}
+        if config.strategy in ("fsdp", "veomni"):
+            extra_kwargs["student_byte_offsets"] = data.get("student_byte_offsets", None)
+            extra_kwargs["teacher_byte_offsets"] = data.get("teacher_byte_offsets", None)
+
         outputs = distillation_loss_fn(
             student_logits=student_logits,
             teacher_hidden_states=data["teacher_hidden_states"],
             teacher_unembed=teacher_unembed,
             config=distillation_config,
             data_format=data_format,
+            **extra_kwargs,
         )
     else:
         match config.strategy:

@@ -35,6 +35,14 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
     Note:
     1. the return input_ids/position_ids/loss_mask are nested tensor.
     2. we will remove "attention_mask", "response" in the return data, but "response_mask" is kept.
+
+    Cross-tokenizer (one-time hack): per-token side fields are normally rmpadded onto
+    the student grid (e.g. ``teacher_hidden_states``), which assumes teacher and student
+    have the SAME token count. That breaks across tokenizers. When ``teacher_byte_offsets``
+    is present we therefore (a) leave the teacher tensors dense -- they live on the
+    teacher's own grid and the loss splits them per-sample -- and (b) rmpad
+    ``student_byte_offsets`` like any other student-aligned field so it stays packed
+    1:1 with the student logits.
     """
     assert "input_ids" in data, "input_ids is required in left-right padding data"
     assert "attention_mask" in data, "attention_mask is required in left-right padding data"
@@ -93,9 +101,24 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
         data["teacher_logprobs"] = teacher_logprobs_nested
         data["teacher_ids"] = teacher_ids_nested
 
+    # Cross-tokenizer (one-time Nitrobrew hack): teacher tensors live on the
+    # *teacher* token grid (different length), so they must NOT be rmpadded onto
+    # the student grid. Their presence is signalled by teacher_byte_offsets; we
+    # leave teacher_hidden_states / teacher_byte_offsets dense [bsz, T, *] and let
+    # the loss split them per-sample. The student byte offsets DO align 1:1 with
+    # student tokens, so we rmpad them like any other per-token student field.
+    cross_tokenizer = data.get("teacher_byte_offsets", None) is not None
+
+    student_byte_offsets = data.get("student_byte_offsets", None)
+    if cross_tokenizer and student_byte_offsets is not None:
+        # (bsz, seqlen, 2) -> nested (total_nnz, 2), aligned with student packing.
+        sbo_rmpad = index_first_axis(student_byte_offsets.flatten(0, 1), indices)
+        sbo_nested = torch.nested.nested_tensor_from_jagged(sbo_rmpad, offsets=cu_seqlens)
+        data["student_byte_offsets"] = sbo_nested
+
     # (bsz, seqlen, D_t) -- Nitrobrew teacher hidden states
     teacher_hidden_states = data.get("teacher_hidden_states", None)
-    if teacher_hidden_states is not None:
+    if teacher_hidden_states is not None and not cross_tokenizer:
         ths_rmpad = index_first_axis(teacher_hidden_states.unsqueeze(-1).flatten(0, 1), indices)
         ths_nested = torch.nested.nested_tensor_from_jagged(ths_rmpad.squeeze(-1), offsets=cu_seqlens)
         data["teacher_hidden_states"] = ths_nested

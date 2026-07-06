@@ -54,6 +54,15 @@ distillation_loss:
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
 
+  # Cross-tokenizer (one-time Nitrobrew hack): align teacher/student by byte
+  # offsets and use the Universal Logit Distillation (sorted-L1) loss. Requires a
+  # nitrobrew loss_mode, the FSDP strategy, and use_policy_gradient=false.
+  cross_tokenizer: false
+
+  # Softmax temperatures for the ULD comparison (cross_tokenizer only).
+  uld_student_temperature: 1.0
+  uld_teacher_temperature: 1.0
+
 
 # Number of GPUs per node in the distillation teacher resource pool
 n_gpus_per_node: 8
@@ -84,6 +93,9 @@ teacher_models:
     key: null
     model_path: null
     num_replicas: 0
+    # Cross-tokenizer (one-time hack): tokenizer used to re-tokenize student text.
+    # Defaults to model_path when null.
+    teacher_tokenizer_path: null
     inference:
       _target_: verl.workers.config.RolloutConfig
       name: ${oc.select:actor_rollout_ref.rollout.name}

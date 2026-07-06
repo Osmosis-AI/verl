@@ -428,6 +428,103 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    def _get_teacher_view_tokenizer(self):
+        """Lazily load the (first) teacher's tokenizer for rollout dumps.
+
+        Only relevant under cross-tokenizer distillation, where the teacher sees a
+        prompt built with its OWN chat template rather than the student's token ids.
+        Returns None when not applicable.
+        """
+        if hasattr(self, "_teacher_view_tok"):
+            return self._teacher_view_tok
+        self._teacher_view_tok = None
+        dist_cfg = getattr(self, "distillation_config", None)
+        if dist_cfg is not None and getattr(dist_cfg.distillation_loss, "cross_tokenizer", False):
+            try:
+                from transformers import AutoTokenizer
+
+                cfg = dist_cfg.teacher_models[next(iter(dist_cfg.teacher_models))]
+                self._teacher_view_tok = AutoTokenizer.from_pretrained(
+                    cfg.resolved_tokenizer_path, trust_remote_code=True
+                )
+            except Exception as e:
+                print(f"Warning: could not load teacher tokenizer for rollout dumps: {e}")
+        return self._teacher_view_tok
+
+    def _dump_train_rollout_sample(self, batch: DataProto) -> None:
+        """Print and save one rollout sample per training batch as markdown.
+
+        Shows the student's prompt and sampled completion, plus (under
+        cross-tokenizer distillation) the prompt as the TEACHER sees it -- rebuilt
+        with the teacher's own chat template in thinking mode, mirroring
+        ``NitrobrewAsyncTeacherManager.compute_teacher_uld_single``. The teacher
+        does not generate; it scores the student completion conditioned on that
+        prompt. Files go to ``<default_local_dir>/rollout_dumps/step_NNNN.md``.
+        """
+        try:
+            prompts = batch.batch["prompts"]  # [B, P] left-padded
+            responses = batch.batch["responses"]  # [B, R] right-padded
+            attention_mask = batch.batch["attention_mask"]  # [B, P+R]
+            prompt_len = prompts.shape[1]
+
+            i = 0  # one printout per batch
+            prompt_ids = prompts[i][attention_mask[i, :prompt_len].bool()].tolist()
+            response_ids = responses[i][attention_mask[i, prompt_len:].bool()].tolist()
+            prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+            response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
+
+            sections = [
+                f"# Rollout sample - step {self.global_steps}",
+                "",
+                "## Student prompt",
+                "",
+                "```",
+                prompt_text,
+                "```",
+                "",
+                "## Student completion (on-policy rollout; the distillation target positions)",
+                "",
+                "```",
+                response_text,
+                "```",
+            ]
+
+            teacher_tok = self._get_teacher_view_tokenizer()
+            raw_prompts = batch.non_tensor_batch.get("raw_prompt")
+            if teacher_tok is not None and raw_prompts is not None and raw_prompts[i] is not None:
+                messages = [dict(m) for m in raw_prompts[i]]
+                try:
+                    teacher_prompt_text = teacher_tok.apply_chat_template(
+                        messages, add_generation_prompt=True, tokenize=False, enable_thinking=True
+                    )
+                except TypeError:
+                    teacher_prompt_text = teacher_tok.apply_chat_template(
+                        messages, add_generation_prompt=True, tokenize=False
+                    )
+                sections += [
+                    "",
+                    "## Teacher-view prompt (teacher's own chat template, thinking mode)",
+                    "",
+                    "```",
+                    teacher_prompt_text,
+                    "```",
+                    "",
+                    "_The teacher does not generate; it scores the student completion above,_"
+                    " _conditioned on this prompt._",
+                ]
+
+            text = "\n".join(sections) + "\n"
+
+            dump_dir = os.path.join(self.config.trainer.default_local_dir, "rollout_dumps")
+            os.makedirs(dump_dir, exist_ok=True)
+            path = os.path.join(dump_dir, f"step_{self.global_steps:04d}.md")
+            with open(path, "w") as f:
+                f.write(text)
+            print(f"\n{text}\n[rollout sample saved to {path}]\n")
+        except Exception as e:
+            # Logging must never take down training.
+            print(f"Warning: failed to dump train rollout sample: {e}")
+
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
@@ -1414,6 +1511,9 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    # Print + save one student/teacher rollout sample per batch.
+                    self._dump_train_rollout_sample(batch)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)

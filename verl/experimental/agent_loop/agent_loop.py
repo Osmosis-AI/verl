@@ -247,7 +247,13 @@ class AgentLoopOutput(BaseModel):
 
 
 class _InternalAgentLoopOutput(AgentLoopOutput):
-    """Internal agent loop output with padded sequences."""
+    """Internal agent loop output with padded sequences.
+
+    Cross-tokenizer (one-time hack) adds two per-token side channels alongside
+    ``teacher_hidden_states``: ``teacher_byte_offsets`` (on the teacher token grid)
+    and ``student_byte_offsets`` (on the student grid). They carry the byte spans
+    the FSDP nitrobrew loss uses to align the two tokenizations.
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -271,6 +277,10 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded token ids corresponding to the teacher log probabilities."""
     teacher_hidden_states: torch.Tensor | None = None
     """Padded teacher hidden states [1, S_padded, D_t] for Nitrobrew."""
+    teacher_byte_offsets: torch.Tensor | None = None
+    """Cross-tokenizer: teacher per-token byte offsets [1, T_padded, 2] (completion-relative)."""
+    student_byte_offsets: torch.Tensor | None = None
+    """Cross-tokenizer: student per-token byte offsets [1, S_padded, 2] (completion-relative)."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
@@ -485,6 +495,10 @@ class AgentLoopWorker:
             self.distillation_loss_config: DistillationLossConfig = self.distillation_config.distillation_loss
             self.teacher_key: str = self.distillation_config.teacher_key
 
+            # Cross-tokenizer (one-time Nitrobrew hack): re-tokenize student text
+            # with the teacher tokenizer and align by byte offsets in the loss.
+            self.cross_tokenizer = bool(getattr(self.distillation_loss_config, "cross_tokenizer", False))
+
             if not hasattr(self, "teacher_server_manager"):
                 if self.distillation_loss_config.loss_settings.use_hidden_states:
                     from verl.experimental.teacher_loop.nitrobrew_teacher import NitrobrewAsyncTeacherManager
@@ -493,8 +507,15 @@ class AgentLoopWorker:
                         raise ValueError(
                             "Nitrobrew distillation requires nitrobrew_worker_handles but none were provided."
                         )
+                    teacher_tokenizer_paths = None
+                    if self.cross_tokenizer:
+                        teacher_tokenizer_paths = {
+                            key: cfg.resolved_tokenizer_path
+                            for key, cfg in self.distillation_config.teacher_models.items()
+                        }
                     self.teacher_server_manager = NitrobrewAsyncTeacherManager(
                         worker_handles=nitrobrew_worker_handles,
+                        teacher_tokenizer_paths=teacher_tokenizer_paths,
                     )
                 else:
                     if not teacher_servers:
@@ -659,6 +680,23 @@ class AgentLoopWorker:
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
+    @staticmethod
+    def _fit_teacher_seq(tensor: torch.Tensor, width: int) -> torch.Tensor:
+        """Fit a [S, *] teacher tensor to [width, *]: right-pad with 0, or left-truncate.
+
+        Left-truncation drops the earliest (prompt) tokens so the completion tail
+        -- the only region used by the cross-tokenizer loss -- is preserved.
+        """
+        from torch.nn import functional as _F
+
+        s = tensor.shape[0]
+        if s == width:
+            return tensor
+        if s > width:
+            return tensor[s - width :]
+        pad = (0, 0) * (tensor.dim() - 1) + (0, width - s)
+        return _F.pad(tensor, pad, value=0)
+
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
@@ -790,16 +828,36 @@ class AgentLoopWorker:
                 pad_token_id=self.tokenizer.pad_token_id,
             )
 
+        from torch.nn import functional as _F
+
+        prompt_width = prompt_output["input_ids"].shape[1]
+        response_width = response_output["input_ids"].shape[1]
+
         # Nitrobrew: pad teacher_hidden_states [S, D_t] to [1, S_padded, D_t].
         teacher_hidden_states = output.extra_fields.pop("teacher_hidden_states", None)
-        if teacher_hidden_states is not None:
-            from torch.nn import functional as _F
+        teacher_byte_offsets = output.extra_fields.pop("teacher_byte_offsets", None)
+        student_byte_offsets = output.extra_fields.pop("student_byte_offsets", None)
 
-            prompt_width = prompt_output["input_ids"].shape[1]
-            response_width = response_output["input_ids"].shape[1]
+        cross_tokenizer = teacher_byte_offsets is not None
+        if teacher_hidden_states is not None and not cross_tokenizer:
+            # Same-tokenizer: teacher tokens align 1:1 with the student grid.
             left_pad = prompt_width - len(output.prompt_ids)
             right_pad = response_width - len(output.response_ids)
             teacher_hidden_states = _F.pad(teacher_hidden_states, (0, 0, left_pad, right_pad), value=0.0).unsqueeze(0)
+        elif cross_tokenizer:
+            # Cross-tokenizer: teacher length differs from the student grid. Pad
+            # the teacher tensors to a fixed width (student total) so the batch
+            # concatenates uniformly; left-truncate if longer to keep completion.
+            teacher_width = prompt_width + response_width
+            teacher_hidden_states = self._fit_teacher_seq(teacher_hidden_states, teacher_width).unsqueeze(0)
+            teacher_byte_offsets = self._fit_teacher_seq(teacher_byte_offsets, teacher_width).unsqueeze(0)
+
+            # Student byte offsets are response-relative [R, 2]; place them on the
+            # full student grid (prompt region (0, 0), then the response slots).
+            r = student_byte_offsets.shape[0]
+            resp_off = _F.pad(student_byte_offsets, (0, 0, 0, response_width - r), value=0)
+            prompt_off = torch.zeros(prompt_width, 2, dtype=resp_off.dtype)
+            student_byte_offsets = torch.cat([prompt_off, resp_off], dim=0).unsqueeze(0)
 
         return _InternalAgentLoopOutput(
             prompt_ids=prompt_output["input_ids"],
@@ -815,6 +873,8 @@ class AgentLoopWorker:
             teacher_logprobs=teacher_logprobs,
             teacher_ids=teacher_ids,
             teacher_hidden_states=teacher_hidden_states,
+            teacher_byte_offsets=teacher_byte_offsets,
+            student_byte_offsets=student_byte_offsets,
             reward_score=output.reward_score,
             num_turns=output.num_turns,
             metrics=output.metrics,
@@ -928,7 +988,17 @@ class AgentLoopWorker:
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Compute teacher signal for single sample (top-k logprobs or hidden states)."""
+        """Compute teacher signal for single sample (top-k logprobs or hidden states).
+
+        Cross-tokenizer (one-time hack): under the nitrobrew (hidden-states) path with
+        ``cross_tokenizer=True``, decode the student prompt/response to text, compute
+        the student's completion-relative byte offsets, and ask the teacher manager to
+        re-tokenize that text with the TEACHER tokenizer (returning teacher hidden
+        states + teacher byte offsets). The three tensors -- ``teacher_hidden_states``,
+        ``teacher_byte_offsets``, ``student_byte_offsets`` -- are stashed on
+        ``output.extra_fields`` and later padded/batched so the FSDP nitrobrew loss can
+        byte-align the two token streams.
+        """
         if self.distillation_enabled and not validate:
             routing_key = None
             if sample_kwargs is not None:
@@ -938,11 +1008,45 @@ class AgentLoopWorker:
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
 
             if self.distillation_loss_config.loss_settings.use_hidden_states:
-                teacher_hidden_states = await self.teacher_server_manager.compute_teacher_hidden_states_single(
-                    sequence_ids=prompt_ids + response_ids,
-                    routing_key=routing_key,
-                )
-                output.extra_fields["teacher_hidden_states"] = teacher_hidden_states
+                if getattr(self, "cross_tokenizer", False):
+                    # Decode student text, re-tokenize with the teacher tokenizer
+                    # (inside the manager), and align by byte offsets in the loss.
+                    prompt_text = self.tokenizer.decode(
+                        prompt_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+                    )
+                    completion_text = self.tokenizer.decode(
+                        response_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+                    )
+                    from verl.trainer.distillation.fsdp.uld_align import byte_offsets_from_token_ids
+
+                    student_byte_offsets = torch.tensor(
+                        byte_offsets_from_token_ids(self.tokenizer, response_ids), dtype=torch.long
+                    )  # [R, 2], completion-relative
+                    # Pass the raw chat turns so the teacher can apply its OWN chat
+                    # template with enable_thinking=True (e.g. put Qwen3 in reasoning
+                    # mode); the prompt only conditions the teacher and is masked out
+                    # of the loss.
+                    prompt_messages = None
+                    if sample_kwargs is not None and sample_kwargs.get("raw_prompt") is not None:
+                        prompt_messages = list(sample_kwargs["raw_prompt"])
+                    (
+                        teacher_hidden_states,
+                        teacher_byte_offsets,
+                    ) = await self.teacher_server_manager.compute_teacher_uld_single(
+                        prompt_text=prompt_text,
+                        completion_text=completion_text,
+                        routing_key=routing_key,
+                        prompt_messages=prompt_messages,
+                    )
+                    output.extra_fields["teacher_hidden_states"] = teacher_hidden_states
+                    output.extra_fields["teacher_byte_offsets"] = teacher_byte_offsets
+                    output.extra_fields["student_byte_offsets"] = student_byte_offsets
+                else:
+                    teacher_hidden_states = await self.teacher_server_manager.compute_teacher_hidden_states_single(
+                        sequence_ids=prompt_ids + response_ids,
+                        routing_key=routing_key,
+                    )
+                    output.extra_fields["teacher_hidden_states"] = teacher_hidden_states
             else:
                 teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                     sequence_ids=prompt_ids + response_ids,
@@ -977,6 +1081,14 @@ class AgentLoopWorker:
         if inputs[0].teacher_hidden_states is not None:
             optional_outputs["teacher_hidden_states"] = torch.cat(
                 [input.teacher_hidden_states for input in inputs], dim=0
+            )
+        if inputs[0].teacher_byte_offsets is not None:
+            optional_outputs["teacher_byte_offsets"] = torch.cat(
+                [input.teacher_byte_offsets for input in inputs], dim=0
+            )
+        if inputs[0].student_byte_offsets is not None:
+            optional_outputs["student_byte_offsets"] = torch.cat(
+                [input.student_byte_offsets for input in inputs], dim=0
             )
         batch = TensorDict(
             {

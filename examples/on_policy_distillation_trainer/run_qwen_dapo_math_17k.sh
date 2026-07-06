@@ -15,14 +15,14 @@ TEACHER_MODEL=Qwen3-32B
 
 USE_POLICY_GRADIENT=True
 DISTILLATION_LOSS_MODE="nitrobrew"
-USE_FUSED_KERNELS=False
+USE_FUSED_KERNELS=True
 
 DISTILLATION_LOSS_MAX_CLAMP=10.0
 DISTILLATION_LOG_PROB_MIN_CLAMP=-10.0
 
 PROJECT_NAME='verl_on_policy_distillation_example_gsm8k'
 
-MAX_PROMPT=512
+MAX_PROMPT=4096
 MAX_RESPONSE_LENGTH=8192
 MAX_NUM_TOKENS=$(( MAX_PROMPT + MAX_RESPONSE_LENGTH + 1 ))
 TRAIN_PROMPT_BSZ=128
@@ -42,8 +42,8 @@ ENFORCE_EAGER=False # true for faster debugging
 
 ############################ Paths ############################
 
-gsm8k_train_path=/data/gsm8k/train.parquet
-gsm8k_test_path=/data/gsm8k/test.parquet
+gsm8k_train_path=/data/dapo-math-17k/train.parquet
+gsm8k_test_path=/data/dapo-math-17k/test.parquet
 
 TRAIN_FILES="['$gsm8k_train_path']"
 TEST_FILES="['$gsm8k_test_path']"
@@ -109,7 +109,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=$USE_DYNAMIC_BSZ
     actor_rollout_ref.rollout.tensor_model_parallel_size=1
     actor_rollout_ref.rollout.name=$ROLLOUT_NAME
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.3
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8
     actor_rollout_ref.rollout.calculate_log_probs=False
     actor_rollout_ref.rollout.max_model_len=$MAX_NUM_TOKENS
     actor_rollout_ref.rollout.max_num_batched_tokens=$MAX_NUM_TOKENS

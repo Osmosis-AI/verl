@@ -19,10 +19,33 @@ the full [N, V] teacher logit tensor. Teacher logits are reconstructed on-the-fl
 as z @ W.T in vocabulary chunks of size C using single-pass online-softmax.
 
 Peak extra memory: O(N * C) per chunk, instead of O(N * V).
+
+CROSS-TOKENIZER (one-time hack)
+-------------------------------
+``compute_nitrobrew_kl`` doubles as the entry point for cross-tokenizer (teacher
+and student use *different* tokenizers) distillation. When ``teacher_byte_offsets``
+is passed, it dispatches to ``_compute_cross_tokenizer_uld`` instead of the
+position-wise shared-vocab KL above. That path:
+  1. selects completion tokens on each side via byte offsets (end-byte > 0),
+  2. reconstructs DENSE teacher logits (z @ W.T) for those tokens -- this is why
+     Nitrobrew is the right host: it already has the full teacher distribution,
+  3. byte-offset-aligns the two token streams into shared chunks,
+  4. compares them with the vocab-agnostic Universal Logit Distillation (sorted
+     prob L1) loss, and
+  5. scatters each chunk's loss back onto the student's predictive position so the
+     output stays (1, total_nnz) and the rest of the pipeline is unchanged.
+The constant-memory online-softmax kernel is intentionally bypassed here (ULD
+needs the full sorted prob vector); acceptable for a one-time run.
 """
 
 import torch
+import torch.nn.functional as F
 
+from verl.trainer.distillation.fsdp.uld_align import (
+    align_by_byte_offsets,
+    merge_groups_first_position,
+    uld_sorted_l1_per_group,
+)
 from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, slice_input_tensor
 from verl.workers.config import DistillationConfig
 
@@ -188,8 +211,25 @@ def compute_nitrobrew_kl(
     teacher_unembed: torch.Tensor,
     config: DistillationConfig,
     data_format: str,
+    student_byte_offsets: torch.Tensor | None = None,
+    teacher_byte_offsets: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Compute Nitrobrew forward KL loss KL(p_T || p_S) for the FSDP path."""
+    """Compute Nitrobrew forward KL loss KL(p_T || p_S) for the FSDP path.
+
+    When ``teacher_byte_offsets`` is provided (cross-tokenizer / one-time hack),
+    dispatch to the byte-offset-aligned Universal Logit Distillation loss instead
+    of the position-wise shared-vocab KL.
+    """
+    if teacher_byte_offsets is not None:
+        return _compute_cross_tokenizer_uld(
+            student_logits=student_logits,
+            teacher_hidden_states=teacher_hidden_states,
+            teacher_unembed=teacher_unembed,
+            student_byte_offsets=student_byte_offsets,
+            teacher_byte_offsets=teacher_byte_offsets,
+            config=config,
+        )
+
     z, T_sp = _unpack_hidden_states(teacher_hidden_states, student_logits)
     z_flat = z.view(T_sp, -1)
     s_flat = student_logits.view(T_sp, -1)
@@ -200,6 +240,102 @@ def compute_nitrobrew_kl(
         loss_config.kd_temperature, loss_config.log_prob_min_clamp,
     )
     return {"distillation_losses": per_token_kl.view(1, T_sp)}
+
+
+def _compute_cross_tokenizer_uld(
+    student_logits: torch.Tensor,
+    teacher_hidden_states: torch.Tensor,
+    teacher_unembed: torch.Tensor,
+    student_byte_offsets: torch.Tensor,
+    teacher_byte_offsets: torch.Tensor,
+    config: DistillationConfig,
+) -> dict[str, torch.Tensor]:
+    """Cross-tokenizer ULD loss (one-time Nitrobrew hack).
+
+    Shapes:
+      - student_logits:        (1, total_nnz, V_s)   packed student logits
+      - student_byte_offsets:  nested -> values (total_nnz, 2), offsets = student cu_seqlens
+      - teacher_hidden_states: dense (B, T_pad, D_t) on the teacher token grid
+      - teacher_byte_offsets:  dense (B, T_pad, 2)
+      - teacher_unembed:       (V_t, D_t)
+
+    Per sample: reconstruct dense teacher logits for completion tokens, softmax
+    both sides, align student<->teacher completion tokens by byte boundaries,
+    reduce each aligned group to a single distribution, and take the sorted-L1
+    ULD distance. The per-group loss is scattered onto the student predictive
+    position so the output is (1, total_nnz) -- consumed by the existing
+    response_mask aggregation.
+    """
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        raise NotImplementedError("cross-tokenizer ULD requires ulysses_sequence_parallel_size=1.")
+    assert student_byte_offsets is not None, "student_byte_offsets required for cross-tokenizer ULD."
+    assert student_byte_offsets.is_nested, "student_byte_offsets must be nested after left_right_2_no_padding."
+
+    loss_config = config.distillation_loss
+    t_student = float(loss_config.uld_student_temperature)
+    t_teacher = float(loss_config.uld_teacher_temperature)
+
+    device = student_logits.device
+    s_vals = student_logits[0]  # (total_nnz, V_s)
+    total_nnz = s_vals.shape[0]
+    cu = student_byte_offsets.offsets().to("cpu")  # (B+1,)
+    s_off_vals = student_byte_offsets.values()  # (total_nnz, 2)
+    W = teacher_unembed.to(device=device, dtype=torch.float32)  # (V_t, D_t)
+    B = teacher_hidden_states.shape[0]
+
+    per_token = torch.zeros(total_nnz, dtype=torch.float32, device=device)
+
+    for i in range(B):
+        start, end = int(cu[i]), int(cu[i + 1])
+        seg_logits = s_vals[start:end]  # (S_i, V_s)
+        seg_off = s_off_vals[start:end]  # (S_i, 2)
+
+        # Student completion tokens (end byte > 0); predictive logits are shifted
+        # left by one (logits at p predict token p+1).
+        s_comp_idx = (seg_off[:, 1] > 0).nonzero(as_tuple=True)[0]
+        s_pred_idx = s_comp_idx - 1
+        keep = s_pred_idx >= 0
+        s_comp_idx, s_pred_idx = s_comp_idx[keep], s_pred_idx[keep]
+        if s_comp_idx.numel() == 0:
+            continue
+
+        # Teacher completion tokens + reconstructed dense logits (shifted).
+        t_off = teacher_byte_offsets[i]  # (T_pad, 2)
+        t_hidden = teacher_hidden_states[i]  # (T_pad, D_t)
+        t_comp_idx = (t_off[:, 1] > 0).nonzero(as_tuple=True)[0]
+        t_pred_idx = t_comp_idx - 1
+        keep_t = t_pred_idx >= 0
+        t_comp_idx, t_pred_idx = t_comp_idx[keep_t], t_pred_idx[keep_t]
+        if t_comp_idx.numel() == 0:
+            continue
+
+        s_off_comp = seg_off[s_comp_idx].tolist()
+        t_off_comp = t_off[t_comp_idx].tolist()
+        s_groups, t_groups = align_by_byte_offsets(s_off_comp, t_off_comp)
+        n_groups = min(len(s_groups), len(t_groups))
+        if n_groups == 0:
+            continue
+        s_groups, t_groups = s_groups[:n_groups], t_groups[:n_groups]
+
+        s_pred_logits = seg_logits.index_select(0, s_pred_idx).float()  # (n_s, V_s)
+        t_pred_hidden = t_hidden.index_select(0, t_pred_idx).to(device=device, dtype=torch.float32)
+        t_pred_logits = t_pred_hidden @ W.t()  # (n_t, V_t)
+
+        s_probs = F.softmax(s_pred_logits / t_student, dim=-1)
+        t_probs = F.softmax(t_pred_logits / t_teacher, dim=-1)
+
+        s_aligned = merge_groups_first_position(s_probs, s_groups)  # (G, V_s)
+        t_aligned = merge_groups_first_position(t_probs, t_groups)  # (G, V_t)
+        group_loss = uld_sorted_l1_per_group(s_aligned, t_aligned)  # (G,)
+
+        # Scatter each group's loss onto the first student token's predictive
+        # position (global packed index). no_padding_2_padding then extracts the
+        # response region with the standard one-token left shift.
+        first_local = s_pred_idx[torch.tensor([g[0] for g in s_groups], device=device, dtype=torch.long)]
+        global_pos = first_local + start
+        per_token = per_token.scatter_add(0, global_pos, group_loss.to(per_token.dtype))
+
+    return {"distillation_losses": per_token.view(1, total_nnz)}
 
 
 # ---------------------------------------------------------------------------
@@ -336,8 +472,15 @@ def compute_nitrobrew_reverse_kl(
     teacher_unembed: torch.Tensor,
     config: DistillationConfig,
     data_format: str,
+    student_byte_offsets: torch.Tensor | None = None,
+    teacher_byte_offsets: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute Nitrobrew reverse KL loss KL(p_S || p_T) for the FSDP path."""
+    if teacher_byte_offsets is not None:
+        raise NotImplementedError(
+            "cross-tokenizer ULD is only implemented for forward KL (loss_mode=nitrobrew), "
+            "not nitrobrew_reverse_kl."
+        )
     z, T_sp = _unpack_hidden_states(teacher_hidden_states, student_logits)
     z_flat = z.view(T_sp, -1)
     s_flat = student_logits.view(T_sp, -1)

@@ -122,7 +122,20 @@ def _compute_svd(w_t: torch.Tensor, d_comp: int, dtype: torch.dtype) -> tuple[to
     """Truncated SVD of the teacher's unembed: ``w_t ~= w_up @ p_down.T``.
 
     Returns ``(w_up [V, d_comp], p_down [D, d_comp])`` cast to ``dtype``.
+
+    When ``d_comp >= D`` (the teacher hidden size) no compression is requested,
+    so the SVD round-trip is an exact identity. Skip the (expensive) full SVD
+    and return ``w_up = w_t`` with an identity ``p_down``: hidden states pass
+    through unprojected and the student reconstructs the exact teacher logits.
+    The returned ``p_down`` then has width ``D`` (not the requested ``d_comp``);
+    callers should derive the effective ``d_comp`` from ``p_down.shape[1]``.
     """
+    d = w_t.shape[1]
+    if d_comp >= d:
+        w_up = w_t.to(dtype)
+        p_down = torch.eye(d, dtype=dtype)
+        return w_up, p_down
+
     u, sigma, vh = torch.linalg.svd(w_t, full_matrices=False)
     u_r = u[:, :d_comp]
     sigma_r = sigma[:d_comp]
@@ -160,6 +173,7 @@ class NitrobrewTeacherWorker:
         torch_dtype = getattr(torch, dtype)
         self._d_comp = d_comp
         self._dtype = torch_dtype
+        self._max_model_len = max_model_len
         self._p_down_cpu = torch.tensor(p_down_list, dtype=torch_dtype)  # [D, d_comp]
         self._p_down_dev: dict[torch.device, torch.Tensor] = {}
 
@@ -212,7 +226,20 @@ class NitrobrewTeacherWorker:
         from vllm import PoolingParams
         from vllm.inputs import TokensPrompt
 
-        params = PoolingParams(task="token_embed", normalize=False)
+        # Cross-tokenizer sequences are re-tokenized with the teacher's tokenizer
+        # and chat template, so they can exceed the student-derived context budget
+        # by a few tokens. Truncate the tail instead of crashing the run: the
+        # byte-offset alignment degrades gracefully when the teacher side is
+        # shorter (callers size byte offsets to the returned hidden states).
+        if len(sequence_ids) > self._max_model_len:
+            logger.warning(
+                "NitrobrewTeacherWorker: truncating sequence from %d to max_model_len=%d tokens",
+                len(sequence_ids),
+                self._max_model_len,
+            )
+            sequence_ids = sequence_ids[: self._max_model_len]
+
+        params = PoolingParams(task="token_embed", use_activation=False)
         prompt = TokensPrompt(prompt_token_ids=sequence_ids)
 
         final = None
@@ -235,12 +262,45 @@ class NitrobrewAsyncTeacherManager:
 
     Mirrors the interface of ``AsyncTeacherLLMServerManager`` but returns
     teacher hidden states instead of ``(teacher_ids, teacher_logprobs)``.
+
+    CROSS-TOKENIZER (one-time hack)
+    -------------------------------
+    The same-tokenizer path (``compute_teacher_hidden_states_single``) feeds the
+    teacher the *student's* token ids -- meaningless when the tokenizers differ.
+    For cross-tokenizer distillation, pass ``teacher_tokenizer_paths`` and call
+    ``compute_teacher_uld_single`` instead: it re-tokenizes the student's decoded
+    text with the TEACHER's own tokenizer, runs the teacher on those ids, and
+    returns ``(hidden_states, teacher_byte_offsets)``. The byte offsets are
+    completion-relative (prompt positions zeroed) so the loss can line the teacher
+    tokens up against the student tokens by shared byte boundaries.
     """
 
-    def __init__(self, worker_handles: dict[str, list[Any]]):
+    def __init__(
+        self,
+        worker_handles: dict[str, list[Any]],
+        teacher_tokenizer_paths: Optional[dict[str, str]] = None,
+    ):
         self._worker_handles = worker_handles
         self._counters = {key: 0 for key in worker_handles}
         self._lock = asyncio.Lock()
+
+        # Cross-tokenizer: load one teacher tokenizer per routing key (CPU, in the
+        # AgentLoopWorker process). Lazy import keeps the non-cross-tokenizer path
+        # free of the transformers tokenizer dependency at construction time.
+        self._teacher_tokenizers: dict[str, Any] = {}
+        if teacher_tokenizer_paths:
+            from transformers import AutoTokenizer
+
+            for key, path in teacher_tokenizer_paths.items():
+                if path is None:
+                    continue
+                tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+                if not tok.is_fast:
+                    raise ValueError(
+                        f"Cross-tokenizer distillation needs a fast teacher tokenizer "
+                        f"(byte offsets) for {key!r} ({path})."
+                    )
+                self._teacher_tokenizers[key] = tok
 
     def _resolve_key(self, routing_key: Optional[str]) -> str:
         if len(self._worker_handles) == 1:
@@ -264,6 +324,74 @@ class NitrobrewAsyncTeacherManager:
 
         result: list = await handles[idx].compute_hidden_states.remote(sequence_ids)
         return torch.tensor(result, dtype=torch.bfloat16)  # [S, d_comp]
+
+    async def compute_teacher_uld_single(
+        self,
+        prompt_text: str,
+        completion_text: str,
+        routing_key: Optional[str] = None,
+        prompt_messages: Optional[list] = None,
+        enable_thinking: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cross-tokenizer (one-time hack) teacher signal.
+
+        Re-tokenizes the prompt + ``completion_text`` with the *teacher* tokenizer,
+        runs the teacher to get per-token hidden states, and returns
+        ``(hidden_states [S_t, d_comp], teacher_byte_offsets [S_t, 2])``. Byte
+        offsets are completion-relative: prompt positions are ``(0, 0)`` so the
+        loss can pick out completion tokens by ``end > 0``.
+
+        Thinking: the prompt only *conditions* the teacher (its positions are masked
+        out of the loss), so when ``prompt_messages`` (the raw chat turns) are given
+        we build the prompt with the TEACHER's own chat template and
+        ``enable_thinking=True``. That puts e.g. Qwen3 into reasoning mode, so its
+        next-token distribution favours ``<think>`` -- which is what the student
+        learns to imitate on-policy. Without this, the teacher just continues the
+        Llama-formatted text and never thinks, so no thinking can be distilled.
+        """
+        from verl.trainer.distillation.fsdp.uld_align import (
+            char_offsets_to_byte_offsets,
+            pad_byte_offsets,
+        )
+
+        key = self._resolve_key(routing_key)
+        tok = self._teacher_tokenizers.get(key)
+        if tok is None:
+            raise ValueError(
+                f"No teacher tokenizer loaded for {key!r}; pass teacher_tokenizer_paths "
+                "to NitrobrewAsyncTeacherManager for cross-tokenizer distillation."
+            )
+
+        # Prompt only conditions the teacher; its positions are masked out of the loss.
+        if prompt_messages is not None:
+            # Use the teacher's own chat template (+ thinking) so the teacher is in
+            # reasoning mode. enable_thinking is Qwen3-specific; fall back if the
+            # template doesn't accept it.
+            messages = [dict(m) for m in prompt_messages]
+            try:
+                prompt_ids = tok.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=True, enable_thinking=enable_thinking
+                )
+            except TypeError:
+                prompt_ids = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+        else:
+            prompt_ids = tok(prompt_text, add_special_tokens=False)["input_ids"]
+        comp_enc = tok(completion_text, add_special_tokens=False, return_offsets_mapping=True)
+        completion_ids = comp_enc["input_ids"]
+        comp_byte_offsets = char_offsets_to_byte_offsets(completion_text, comp_enc["offset_mapping"])
+
+        sequence_ids = list(prompt_ids) + list(completion_ids)
+        byte_offsets = [(0, 0)] * len(prompt_ids) + comp_byte_offsets
+
+        handles = self._worker_handles[key]
+        async with self._lock:
+            idx = self._counters[key] % len(handles)
+            self._counters[key] += 1
+
+        result: list = await handles[idx].compute_hidden_states.remote(sequence_ids)
+        hidden = torch.tensor(result, dtype=torch.bfloat16)  # [S_t, d_comp]
+        offsets = pad_byte_offsets(byte_offsets, hidden.shape[0])  # [S_t, 2]
+        return hidden, offsets
 
 
 class NitrobrewTeacherModelManager:
@@ -311,18 +439,33 @@ class NitrobrewTeacherModelManager:
             torch_dtype = getattr(torch, dtype)
 
             logger.warning(
-                "NitrobrewTeacherModelManager: loading lm_head for '%s' (%s) and computing SVD (d_comp=%d)",
+                "NitrobrewTeacherModelManager: loading lm_head for '%s' (%s) (requested d_comp=%d)",
                 key,
                 model_path,
                 d_comp,
             )
             w_t = _load_lm_head_weight(model_path)
+            hidden_dim = w_t.shape[1]
+            skip_svd = d_comp >= hidden_dim
+            if skip_svd:
+                logger.warning(
+                    "NitrobrewTeacherModelManager: d_comp=%d >= hidden_dim=%d, skipping SVD "
+                    "(identity projection, exact teacher logits)",
+                    d_comp,
+                    hidden_dim,
+                )
+            else:
+                logger.warning("NitrobrewTeacherModelManager: computing SVD (d_comp=%d)", d_comp)
             w_up, p_down = _compute_svd(w_t, d_comp, torch_dtype)
             del w_t
+            # _compute_svd may clamp the identity path to the full hidden dim, so
+            # keep d_comp in sync with the projection width sent to the workers.
+            d_comp = p_down.shape[1]
             logger.warning(
-                "NitrobrewTeacherModelManager: SVD done w_up %s, p_down %s",
+                "NitrobrewTeacherModelManager: projection ready w_up %s, p_down %s (d_comp=%d)",
                 tuple(w_up.shape),
                 tuple(p_down.shape),
+                d_comp,
             )
 
             handles = []

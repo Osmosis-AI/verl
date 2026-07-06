@@ -31,6 +31,13 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 class DistillationLossConfig(BaseConfig):
     """Configuration for distillation loss settings.
 
+    Cross-tokenizer (one-time hack): ``cross_tokenizer`` switches the nitrobrew
+    (hidden-states) loss to byte-offset alignment + Universal Logit Distillation so
+    teacher and student can use different tokenizers. It is only valid with a
+    nitrobrew ``loss_mode`` and ``use_policy_gradient=False`` (enforced in
+    ``__post_init__``); ``uld_student_temperature`` / ``uld_teacher_temperature``
+    scale the two distributions before the ULD comparison.
+
     loss_mode (str):
         Distillation loss function to use.
     topk (int, optional):
@@ -75,6 +82,16 @@ class DistillationLossConfig(BaseConfig):
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
 
+    # --- Cross-tokenizer (one-time Nitrobrew hack) ---
+    # When True, the nitrobrew loss path aligns teacher/student by byte offsets
+    # and uses the Universal Logit Distillation (sorted-L1) loss instead of the
+    # position-wise shared-vocab KL. Requires loss_mode in the nitrobrew family
+    # and the FSDP strategy. See verl/trainer/distillation/fsdp/nitrobrew_loss.py.
+    cross_tokenizer: bool = False
+    # Softmax temperatures applied before the ULD comparison (cross_tokenizer only).
+    uld_student_temperature: float = 1.0
+    uld_teacher_temperature: float = 1.0
+
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
     # batch_num_tokens: number of valid tokens in global batch
@@ -111,10 +128,29 @@ class DistillationLossConfig(BaseConfig):
                 " wrt model weights does not depend on teacher log probabilities."
             )
 
+        if self.cross_tokenizer:
+            # One-time hack: only the supervised nitrobrew (hidden-states) path is
+            # wired for cross-tokenizer ULD. Fail fast on unsupported combos.
+            if not self.loss_settings.use_hidden_states:
+                raise ValueError(
+                    "cross_tokenizer=True requires a nitrobrew loss_mode "
+                    f"(use_hidden_states), got loss_mode={self.loss_mode!r}."
+                )
+            if self.use_policy_gradient:
+                raise ValueError(
+                    "cross_tokenizer=True requires use_policy_gradient=False "
+                    "(supervised backprop); per-token reward attribution across "
+                    "tokenizers is not supported."
+                )
+
 
 @dataclass
 class DistillationTeacherModelConfig(BaseConfig):
     """Configuration for on-policy distillation teacher.
+
+    Cross-tokenizer (one-time hack): ``teacher_tokenizer_path`` is the tokenizer used
+    to re-tokenize student text with the teacher's own vocabulary (defaults to
+    ``model_path`` via ``resolved_tokenizer_path``).
 
     key (str, optional):
         Identifier to route examples to the teacher model in multi-teacher setting.
@@ -139,6 +175,13 @@ class DistillationTeacherModelConfig(BaseConfig):
     # PCA rank used by the nitrobrew loss to compress this teacher's hidden
     # states. Required when distillation_loss.loss_mode == "nitrobrew".
     nitrobrew_d_comp: int | None = None
+    # Tokenizer to re-tokenize student text with under cross-tokenizer (one-time
+    # hack) distillation. Defaults to model_path when None.
+    teacher_tokenizer_path: str | None = None
+
+    @property
+    def resolved_tokenizer_path(self) -> str | None:
+        return self.teacher_tokenizer_path or self.model_path
 
     @property
     def per_replica_world_size(self) -> int:
